@@ -35,6 +35,50 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
+# Diagnostic: pin a GPU "Memory access fault" to a specific dispatch arm in
+# the AITER FA backend. Activate with `VLLM_ROCM_AITER_TRACE_ATTN=1`.
+# When enabled, every kernel launch in `forward()` and `do_kv_cache_update()`
+# is bracketed by a synchronize+print pair. The kernel whose `before <stage>`
+# line is the last trace before the fault message is the culprit.
+import os as _os
+import sys as _sys
+import threading as _threading
+
+_AITER_TRACE_ON: bool = _os.environ.get("VLLM_ROCM_AITER_TRACE_ATTN", "0") == "1"
+_AITER_TRACE_LOCAL = _threading.local()
+
+
+def _aiter_trace_event(stage: str, when: str, **info) -> None:
+    """When tracing is enabled, sync the GPU and emit a stamped log line.
+
+    `when` should be "before" or "after". A fault that surfaces during the
+    sync inside this function is attributed to the most-recent `before`
+    label in the log; the corresponding `after` will be missing.
+
+    The synchronize() is skipped while a CUDA graph is being captured —
+    sync is illegal inside a capture region (HIP raises
+    `hipErrorStreamCaptureUnsupported`). For capture replay, kernels
+    inside the captured graph won't have individual sync points anyway;
+    the whole graph runs as one unit and any fault inside it surfaces
+    at the next out-of-graph sync.
+    """
+    if not _AITER_TRACE_ON:
+        return
+    counter = getattr(_AITER_TRACE_LOCAL, "counter", 0)
+    if when == "before":
+        counter += 1
+        _AITER_TRACE_LOCAL.counter = counter
+    pid = _os.getpid()
+    capturing = torch.cuda.is_current_stream_capturing()
+    parts = [f"i={counter}"]
+    if capturing:
+        parts.append("capturing=1")
+    parts.extend(f"{k}={v}" for k, v in info.items())
+    msg = f"[AITER-TRACE pid={pid}] {when} {stage} " + " ".join(parts)
+    print(msg, flush=True, file=_sys.stderr)
+    if not capturing:
+        torch.cuda.synchronize()
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -708,6 +752,31 @@ class AiterFlashAttentionMetadataBuilder(
         skip split_decodes_prefills_and_extends() and avoid all .cpu() /
         .item() calls that would otherwise break CUDA graph capture.
         """
+        # Allocate the per-block scale tensor for fp8 SHUFFLE kv cache.
+        # The same lazy upgrade lives in build(), but the MTP/drafter layer
+        # uses its own metadata-builder instance whose first/only call is
+        # this one — so without this upgrade self.scale stays at the
+        # __init__ placeholder shape (1,), and the asm SHUFFLE q=1 kernel
+        # (paged_attention_common) reads K_QScale_asm out of bounds and
+        # the GPU faults. See:
+        #   mtp_shuffle_kv_cache/README.md → "Diagnosis 5.B".
+        if (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and self.scale.numel() == 1
+            and is_quantized_kv_cache(self.vllm_config.cache_config.cache_dtype)
+        ):
+            layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+            first_layer_name = next(iter(layers))
+            kv_cache_shape = self.vllm_config.compilation_config.static_forward_context[
+                first_layer_name
+            ].kv_cache.shape
+            num_blocks = kv_cache_shape[1]
+            self.scale = torch.ones(
+                [num_blocks, self.num_heads_kv, self.block_size],
+                dtype=torch.float32,
+                device=self.device,
+            )
+
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
 
@@ -1118,6 +1187,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 prefill_key = key[num_decode_tokens + num_extend_tokens :]
                 prefill_value = value[num_decode_tokens + num_extend_tokens :]
 
+                _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                    layer, "prefix", "?"
+                )
+                _aiter_trace_event(
+                    "prefill_varlen",
+                    "before",
+                    layer=_layer_tag,
+                    q_shape=tuple(prefill_query.shape),
+                    max_q=int(attn_metadata.prefill_metadata.max_query_len),
+                    max_k=int(attn_metadata.prefill_metadata.max_seq_len),
+                    causal=bool(attn_metadata.causal),
+                )
                 rocm_aiter_ops.flash_attn_varlen_func(
                     q=prefill_query,
                     k=prefill_key,
@@ -1134,6 +1215,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     alibi_slopes=self.alibi_slopes,
                     out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
                 )
+                _aiter_trace_event("prefill_varlen", "after", layer=_layer_tag)
 
             # calculate for extends
             if num_extends > 0:
@@ -1150,6 +1232,17 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                     k_scale = attn_metadata.k_scale
                     v_scale = attn_metadata.v_scale
+                _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                    layer, "prefix", "?"
+                )
+                _aiter_trace_event(
+                    "extend",
+                    "before",
+                    layer=_layer_tag,
+                    q_shape=tuple(extend_queries.shape),
+                    max_q=int(attn_metadata.extend_metadata.max_query_len),
+                    max_k=int(attn_metadata.extend_metadata.max_seq_len),
+                )
                 self.extend_forward(
                     attn_metadata=attn_metadata,
                     query=extend_queries,
@@ -1171,6 +1264,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     k_scale=k_scale,
                     v_scale=v_scale,
                 )
+                _aiter_trace_event("extend", "after", layer=_layer_tag)
 
             # calculate for decodes
             if num_decodes > 0:
@@ -1179,11 +1273,29 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
                 # Multi-token speculative decode path.
                 if decode_max_query_len > 1:
-                    assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
-                        "Shuffle KV cache layout is not supported with "
-                        "speculative decoding (multi-token decode)."
-                    )
+                    is_shuffle = rocm_aiter_ops.is_shuffle_kv_cache_enabled()
                     if not attn_metadata.causal:
+                        # mha_v3 / flash_attn_with_kvcache does not yet
+                        # understand SHUFFLE strides. The aiter_my_fork
+                        # patch only added native SHUFFLE support to
+                        # `unified_attention` (the causal=True arm
+                        # below). Until flash_attn_3 grows a
+                        # KV_CACHE_LAYOUT analogue, keep the assertion
+                        # gated to this specific arm so SHUFFLE+MTP
+                        # still works on models that hit the causal
+                        # arm (which is the typical case — see
+                        # `eagle.py:968` setting causal=True on the
+                        # spec-common metadata).
+                        assert not is_shuffle, (
+                            "Shuffle KV cache layout + multi-token "
+                            "decode + causal=False is not supported. "
+                            "The non-causal MTP path uses "
+                            "`mha_v3.flash_attn_with_kvcache`, which "
+                            "does not yet have a SHUFFLE arm in "
+                            "aiter_my_fork. The causal=True path "
+                            "(used by GLM-4.7 MTP via eagle.py:968) "
+                            "supports SHUFFLE natively."
+                        )
                         from aiter.ops.triton.attention.mha_v3 import (
                             flash_attn_with_kvcache,
                         )
@@ -1194,6 +1306,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             decode_max_query_len,
                             query.shape[1],
                             query.shape[2],
+                        )
+                        _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                            layer, "prefix", "?"
+                        )
+                        _aiter_trace_event(
+                            "verify_mha_v3",
+                            "before",
+                            layer=_layer_tag,
+                            q_shape=tuple(decode_query.shape),
+                            max_q=int(decode_max_query_len),
+                            num_decodes=int(num_decodes),
+                            causal=bool(attn_metadata.causal),
                         )
                         decode_out = flash_attn_with_kvcache(
                             q=decode_query,
@@ -1209,6 +1333,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             v_descale=layer._v_scale.expand(descale_shape),
                             page_table=attn_metadata.block_table[:num_decodes],
                         )
+                        _aiter_trace_event("verify_mha_v3", "after", layer=_layer_tag)
                         output[:num_decode_tokens].copy_(
                             decode_out.reshape(
                                 num_decode_tokens,
@@ -1224,9 +1349,45 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             unified_attention,
                         )
 
-                        descale_shape = (
-                            num_decodes,
-                            key_cache.shape[2],
+                        # Under SHUFFLE layout the cache is written at
+                        # unit scale by `reshape_and_cache_shuffle_kernel`
+                        # (k_scale = v_scale = 1.0; see top of this file).
+                        # That matches what `paged_attention_common`
+                        # already assumes for q=1 SHUFFLE decode (lines
+                        # ~1599-1603 below), so we drop the per-layer
+                        # descale here too. For NHD we keep the existing
+                        # `layer._k_scale.expand(...)` plumbing.
+                        if is_shuffle:
+                            k_descale_arg = None
+                            v_descale_arg = None
+                        else:
+                            descale_shape = (
+                                num_decodes,
+                                key_cache.shape[2],
+                            )
+                            k_descale_arg = layer._k_scale.expand(descale_shape)
+                            v_descale_arg = layer._v_scale.expand(descale_shape)
+                        _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                            layer, "prefix", "?"
+                        )
+                        _stage = (
+                            "verify_unified_SHUFFLE"
+                            if is_shuffle
+                            else "verify_unified_NHD"
+                        )
+                        _aiter_trace_event(
+                            _stage,
+                            "before",
+                            layer=_layer_tag,
+                            q_shape=tuple(query[:num_decode_tokens].shape),
+                            kc_shape=tuple(key_cache.shape),
+                            num_decodes=int(num_decodes),
+                            max_q=int(decode_max_query_len),
+                            max_k=int(attn_metadata.max_seq_len),
+                            head_size=int(self.head_size),
+                            bt_shape=tuple(
+                                attn_metadata.block_table[:num_decodes].shape
+                            ),
                         )
                         unified_attention(
                             q=query[:num_decode_tokens],
@@ -1246,9 +1407,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             block_table=attn_metadata.block_table[:num_decodes],
                             softcap=self.logits_soft_cap,
                             q_descale=None,
-                            k_descale=layer._k_scale.expand(descale_shape),
-                            v_descale=layer._v_scale.expand(descale_shape),
+                            k_descale=k_descale_arg,
+                            v_descale=v_descale_arg,
+                            kv_cache_layout="SHUFFLE" if is_shuffle else "NHD",
                         )
+                        _aiter_trace_event(_stage, "after", layer=_layer_tag)
                     return
 
                 # The ll4mi kernel in paged_attention_v1 requires
@@ -1260,10 +1423,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 use_unified_attention = self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI
 
                 if use_unified_attention:
-                    assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
-                        "unified_attention fallback with shuffle layout "
-                        "is not supported yet."
-                    )
+                    # Small-head-size (<64) q=1 decode fallback. The
+                    # patched `unified_attention` now natively handles
+                    # SHUFFLE layout via `kv_cache_layout="SHUFFLE"`,
+                    # so the historical assertion can be dropped.
+                    is_shuffle = rocm_aiter_ops.is_shuffle_kv_cache_enabled()
                     from aiter.ops.triton.unified_attention import (
                         unified_attention,
                     )
@@ -1271,9 +1435,32 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     decode_cu_seqlens_q = attn_metadata.query_start_loc[
                         : num_decodes + 1
                     ]
-                    descale_shape = (
-                        num_decodes,
-                        key_cache.shape[2],
+                    if is_shuffle:
+                        k_descale_arg = None
+                        v_descale_arg = None
+                    else:
+                        descale_shape = (
+                            num_decodes,
+                            key_cache.shape[2],
+                        )
+                        k_descale_arg = layer._k_scale.expand(descale_shape)
+                        v_descale_arg = layer._v_scale.expand(descale_shape)
+                    _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                        layer, "prefix", "?"
+                    )
+                    _stage = (
+                        "decode_unified_smallhead_SHUFFLE"
+                        if is_shuffle
+                        else "decode_unified_smallhead_NHD"
+                    )
+                    _aiter_trace_event(
+                        _stage,
+                        "before",
+                        layer=_layer_tag,
+                        q_shape=tuple(query[:num_decode_tokens].shape),
+                        num_decodes=int(num_decodes),
+                        max_k=int(attn_metadata.max_seq_len),
+                        head_size=int(self.head_size),
                     )
                     unified_attention(
                         q=query[:num_decode_tokens],
@@ -1291,9 +1478,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         block_table=attn_metadata.block_table[:num_decodes],
                         softcap=self.logits_soft_cap,
                         q_descale=None,
-                        k_descale=layer._k_scale.expand(descale_shape),
-                        v_descale=layer._v_scale.expand(descale_shape),
+                        k_descale=k_descale_arg,
+                        v_descale=v_descale_arg,
+                        kv_cache_layout="SHUFFLE" if is_shuffle else "NHD",
                     )
+                    _aiter_trace_event(_stage, "after", layer=_layer_tag)
                 elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                     _, num_heads, head_size = query.shape
                     num_seqs = attn_metadata.seq_lens.shape[0]
@@ -1335,6 +1524,29 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         if attn_metadata.v_scale is None
                         else attn_metadata.v_scale
                     )
+                    _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                        layer, "prefix", "?"
+                    )
+                    _aiter_trace_event(
+                        "decode_paged_common_SHUFFLE",
+                        "before",
+                        layer=_layer_tag,
+                        q_shape=tuple(query[:num_decode_tokens].shape),
+                        kc_shape=tuple(new_key_cache.shape),
+                        num_decodes=int(num_decodes),
+                        max_k=int(attn_metadata.max_seq_len),
+                        head_size=int(head_size),
+                        kscale_kind=(
+                            "attn_meta"
+                            if attn_metadata.k_scale is not None
+                            else "layer"
+                        ),
+                        kscale_shape=(
+                            tuple(k_qscale.shape)
+                            if torch.is_tensor(k_qscale)
+                            else "scalar"
+                        ),
+                    )
                     rocm_aiter_ops.paged_attention_common(
                         Q=query[:num_decode_tokens],
                         K=new_key_cache,
@@ -1356,6 +1568,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         out_=output[:num_decode_tokens],
                         kv_cache_dtype=self.kv_cache_dtype,
                     )
+                    _aiter_trace_event(
+                        "decode_paged_common_SHUFFLE", "after", layer=_layer_tag
+                    )
                 else:
                     _, num_heads, head_size = query.shape
                     nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
@@ -1376,6 +1591,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     # torch.ops.aiter
                     import aiter  # noqa: F401
 
+                    _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                        layer, "prefix", "?"
+                    )
+                    _aiter_trace_event(
+                        "decode_paged_v1_NHD",
+                        "before",
+                        layer=_layer_tag,
+                        q_shape=tuple(query[:num_decode_tokens].shape),
+                        num_decodes=int(num_decodes),
+                        max_k=int(attn_metadata.max_seq_len),
+                        head_size=int(head_size),
+                    )
                     torch.ops.aiter.paged_attention_v1(
                         output[:num_decode_tokens],
                         workspace_buffer,
@@ -1397,6 +1624,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         _PARTITION_SIZE_ROCM,
                         1,
                         self.sliding_window[0] + 1,
+                    )
+                    _aiter_trace_event(
+                        "decode_paged_v1_NHD", "after", layer=_layer_tag
                     )
         else:
             raise NotImplementedError(
@@ -1437,6 +1667,17 @@ class AiterFlashAttentionImpl(AttentionImpl):
             assert k_scale is not None and v_scale is not None, (
                 "k_scale and v_scale are required for shuffled update"
             )
+            _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                layer, "prefix", "?"
+            )
+            _trace_info = dict(
+                layer=_layer_tag,
+                key_shape=tuple(key.shape),
+                kc_shape=tuple(key_cache.shape),
+                slots=int(slot_mapping.shape[0]),
+                k_scale_shape=tuple(k_scale.shape) if torch.is_tensor(k_scale) else "scalar",
+            )
+            _aiter_trace_event("cache_update_shuffle", "before", **_trace_info)
             # TODO: Add correct KV cache handling for hybrid model. KV cache
             # may not be contiguous if mamba state exists.
             reshape_and_cache_shuffle_triton(
@@ -1449,7 +1690,19 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 k_scale,
                 v_scale,
             )
+            _aiter_trace_event("cache_update_shuffle", "after", layer=_layer_tag)
         else:
+            _layer_tag = getattr(layer, "layer_name", None) or getattr(
+                layer, "prefix", "?"
+            )
+            _aiter_trace_event(
+                "cache_update_flash",
+                "before",
+                layer=_layer_tag,
+                key_shape=tuple(key.shape),
+                kc_shape=tuple(key_cache.shape),
+                slots=int(slot_mapping.shape[0]),
+            )
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
@@ -1460,6 +1713,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+            _aiter_trace_event("cache_update_flash", "after", layer=_layer_tag)
 
     def fused_rope_kvcache_supported(self):
         # Only support fusion when shuffle KV cache layout is not used;
