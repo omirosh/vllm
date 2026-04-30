@@ -1961,10 +1961,18 @@ class GPUModelRunner(
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
             )
+            prev_positions_gpu = self.prev_positions.gpu[:num_reqs]
+            # Avoid 0/1 specialization recompiles inside the
+            # @torch.compile'd update_num_computed_tokens_for_batch_change;
+            # see the function docstring for details.
+            torch._dynamo.decorators.mark_unbacked(prev_positions_gpu, 0)
+            torch._dynamo.decorators.mark_unbacked(
+                self.valid_sampled_token_count_gpu, 0
+            )
             update_num_computed_tokens_for_batch_change(
                 self.num_computed_tokens,
                 self.num_accepted_tokens.gpu[:num_reqs],
-                self.prev_positions.gpu[:num_reqs],
+                prev_positions_gpu,
                 self.valid_sampled_token_count_gpu,
                 self.prev_num_draft_tokens.gpu,
                 cpu_values,

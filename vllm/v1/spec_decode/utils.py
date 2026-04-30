@@ -576,6 +576,15 @@ def update_num_computed_tokens_for_batch_change(
 
     Requests that had drafts: corrected = prev_gpu + valid_count.
     New requests or non-draft (e.g. prefills): use CPU value directly.
+
+    NOTE: callers must invoke `torch._dynamo.decorators.mark_unbacked(t, 0)`
+    on `prev_positions` and `valid_sampled_token_count` before calling
+    this function. Even with `dynamic=True`, Dynamo otherwise specializes
+    the per-request batch axis when it first sees size 1 and recompiles
+    on every new size class (we measured ~4 cascaded recompiles totaling
+    a ~22 ms bubble between decode steps under MTP). The marker has to
+    live at the call site so Dynamo sees it at input registration; see
+    `vllm/v1/sample/sampler.py` for the same pattern.
     """
     # Clamp because prev_positions can be -1 for new requests
     gather_indices = prev_positions.clamp(min=0)
