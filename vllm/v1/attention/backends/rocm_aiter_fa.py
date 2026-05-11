@@ -72,6 +72,126 @@ _QLEN2_ASM_ALL_ON: bool = (
     _os.environ.get("VLLM_ROCM_QLEN2_ASM_ALL", "0") == "1"
 )
 
+# Opt-in gate for the q>1 / SHUFFLE / causal MTP HIP fast path. Routes
+# to the MTP-templated `paged_attention_ll4mi_QKV_mfma16_kernel`
+# (`csrc/cpp_itfs/pa/pa.cuh`) via `forward_decode(mtp=qlen)`. Off by
+# default until production-validated; set `VLLM_ROCM_QLEN_HIP=1` to
+# enable.
+#
+# Standalone microbenchmarks at GLM-4.7-FP8 / TP=4 / MI355X
+# (`mtp_shuffle_kv_cache/bench_pa_hip_qlen2.py`) showed HIP MTP is
+# 2.0×–3.1× faster than `unified_attention` across the entire mc x
+# ctx band at qlen=2 and qlen=3 — and at high-mc + long-ctx it also
+# beats the asm path (ctx=16384, mc=32, qlen=3: HIP 85µs vs asm
+# 157µs). End-to-end TPOT impact still needs production A/B; gate
+# off by default until that completes.
+#
+# Combination semantics with `VLLM_ROCM_QLEN2_ASM` /
+# `VLLM_ROCM_QLEN2_ASM_ALL`:
+#   QLEN2_ASM=0, QLEN_HIP=0 -> unified_attention everywhere (vLLM main)
+#   QLEN2_ASM=1, QLEN_HIP=0 -> asm at high-mc qlen=2, unified else
+#                              (current K=1 production path, Run 5.F)
+#   QLEN2_ASM=1, QLEN2_ASM_ALL=1, QLEN_HIP=0
+#                           -> asm at *all* mc qlen=2 (Run 5.E gate
+#                              extension; covers low-mc short-ctx
+#                              rectangle, captures cleanly via the
+#                              same Run 5.F binary)
+#   QLEN2_ASM=0, QLEN_HIP=1 -> HIP for all q>1 SHUFFLE
+#                              (covers K=2 catalog gap; currently
+#                              blocked on captured-graph fault, Run 5.H)
+#   QLEN2_ASM=1, QLEN_HIP=1 -> asm at high-mc qlen=2 (existing
+#                              binary), HIP everywhere else q>1
+#                              (hybrid: asm priority, HIP fills gaps)
+_QLEN_HIP_ON: bool = _os.environ.get("VLLM_ROCM_QLEN_HIP", "0") == "1"
+# When set in addition to VLLM_ROCM_QLEN_HIP, back the workspace's three
+# slabs (tmp_out / exp_sums / max_logits) with views into a *single*
+# torch.empty(...uint8) allocation per `max_num_partitions` bucket,
+# instead of three separate torch.empty allocations. This is a focused
+# A/B test for the captured-graph fault hypothesis "the bug is in how
+# captured CUDA graphs replay three separate pointer arguments to the
+# AITER PA kernel". Same kernel, same dispatcher
+# (`paged_attention_common(force_hip=True)`), only the workspace
+# allocation pattern changes. See README Run 5.H.
+_QLEN_HIP_PACKED_ON: bool = (
+    _os.environ.get("VLLM_ROCM_QLEN_HIP_PACKED", "0") == "1"
+)
+# When set in addition to VLLM_ROCM_QLEN_HIP, allocate the three workspace
+# slabs (tmp_out / exp_sums / max_logits) **per call** with `torch.empty(...)`
+# instead of pre-allocating one shared workspace per bucket. This mirrors
+# the q=1 SHUFFLE arm (legacy `torch.ops._C.paged_attention_rocm`) which
+# uses per-call allocation and is known to survive captures in production.
+# Hypothesis: a single pre-alloc tensor shared across many captured graphs
+# is being aliased somewhere in HIP graph capture, so giving every captured
+# graph its own unique workspace tensor address might side-step the fault.
+# Mutually overrides VLLM_ROCM_QLEN_HIP_PACKED (per-call cannot pre-pack).
+# See README Run 5.H.
+_QLEN_HIP_PERCALL_ON: bool = (
+    _os.environ.get("VLLM_ROCM_QLEN_HIP_PERCALL", "0") == "1"
+)
+# When set in addition to VLLM_ROCM_QLEN_HIP, print a one-line diagnostic
+# **immediately before** every HIP MTP kernel dispatch. Combined with
+# `HIP_LAUNCH_BLOCKING=1`, the LAST `[qlen_hip_diag]` line in the log
+# pin-points the kernel call that issued the bad memory op (whereas
+# `Memory access fault by GPU node-X on address 0x...` alone only gives
+# the address). Volume is bounded: ~92 attention layers × 2 forwards
+# (small + big) per capture step = ~184 lines per step. With 50 capture
+# steps the total stays well under 10k lines, several orders of
+# magnitude below `AMD_LOG_LEVEL=4`. Off by default.
+_QLEN_HIP_DIAG_ON: bool = (
+    _os.environ.get("VLLM_ROCM_QLEN_HIP_DIAG", "0") == "1"
+)
+# When set in addition to VLLM_ROCM_QLEN_HIP, call
+# `torch.cuda.synchronize()` immediately before each HIP MTP dispatch
+# **whenever the current stream is NOT capturing** (sync is illegal
+# under capture). Workaround for the bug surfaced by Run 5.H's diag:
+# the first eager HIP MTP call right after a captured-graph-mode BIG
+# forward ends faults with a "P=512 stride applied to a P=1 buffer"
+# pattern (see README Run 5.H), even though Python correctly passes
+# `max_seq_len=2`. This is consistent with a HIP runtime leaking
+# captured-stream state (or a concurrent captured-graph replay
+# rebinding `tmp_out`) into the eager dispatch. A fence here forces
+# the stream to a clean state before the kernel launch. If the fence
+# clears the fault, ship as a permanent guard for the q>1 SHUFFLE
+# HIP arm.
+_QLEN_HIP_FENCE_ON: bool = (
+    _os.environ.get("VLLM_ROCM_QLEN_HIP_FENCE", "0") == "1"
+)
+# Skip the HIP MTP arm and fall back to `unified_attention` whenever
+# `max_seq_len <= VLLM_ROCM_QLEN_HIP_MIN_K`. Run 5.H 2026-05-07 diag
+# pinned the captured-graph fault to the dummy warmup shape:
+# `max_seq_len=2`, `P=1`, `gridDim.y=1` → kernel observably runs with
+# `gridDim.y=512` despite the host wrapper setting `gridDim.y=1`. The
+# fault hits the very first eager SMALL call after step 16's BIG
+# capture finishes, every run, on every rank. Inserting an explicit
+# `torch.cuda.synchronize()` before the launch (`VLLM_ROCM_QLEN_HIP_FENCE=1`)
+# does not clear it, ruling out concurrent-replay races.
+#
+# `max_seq_len <= 256` is the exact `max_num_partitions=1` case — the
+# only one we've ever seen fault. At inference, real per-seq KV
+# lengths are far larger; this gate only fires on vLLM's capture-time
+# dummy warmup data, where unified_attention is already fast enough.
+# Default `257` (i.e. require `max_seq_len > 256` for HIP MTP) keeps
+# the HIP arm engaged for every realistic workload.
+try:
+    _QLEN_HIP_MIN_K: int = int(
+        _os.environ.get("VLLM_ROCM_QLEN_HIP_MIN_K", "257")
+    )
+except ValueError:
+    _QLEN_HIP_MIN_K = 257
+
+# Max entries in `AiterFlashAttentionImpl._qlen_hip_workspace`. Each bucket
+# holds the (tmp_out, exp_sums, max_logits) for one raw P value. Since the
+# kernel reads `max_num_partitions = gridDim.y` directly (see `pa.cuh:98`)
+# we cannot collapse buckets by rounding P; instead we cap the dict and
+# evict oldest entries past the cap. 16 covers 16 distinct context-length
+# slices (4096-token spans for partition=256), enough that real-traffic
+# locality keeps the working set hot.
+try:
+    _QLEN_HIP_WS_MAX_BUCKETS: int = int(
+        _os.environ.get("VLLM_ROCM_QLEN_HIP_WS_MAX_BUCKETS", "16")
+    )
+except ValueError:
+    _QLEN_HIP_WS_MAX_BUCKETS = 16
 _AITER_TRACE_LOCAL = _threading.local()
 
 
@@ -580,6 +700,213 @@ class AiterFlashAttentionMetadataBuilder(
                 device=self.device,
             )
 
+            # One-shot pre-allocation of HIP MTP workspace buffers. Must
+            # run BEFORE any CUDA graph capture: when allocations happen
+            # mid-capture they are routed into the graph's private memory
+            # pool, which then aliases incorrectly across other captured
+            # graphs (manifested as a deferred GPU memory access fault at
+            # `decode, FULL` capture step 17). `build()` runs in eager
+            # mode, outside any capture context, so the allocation lands
+            # in the regular caching allocator and persists for all
+            # subsequent calls including captured-graph replays.
+            #
+            # The workspace lives on `AiterFlashAttentionImpl` as a
+            # class-level dict (see top of `AiterFlashAttentionImpl`) and
+            # is keyed by `max_num_partitions`. We pre-fill the two
+            # buckets that vLLM exercises during graph capture:
+            #   * P=1                 — for tiny / empty contexts
+            #   * P=ceil(max_model_len/_PARTITION_SIZE_ROCM) — for full ctx
+            #
+            # We compute T (= num_decode_tokens upper bound) as
+            # max_num_seqs * decode_max_query_len, which covers all
+            # batch sizes vLLM might capture. `decode_max_query_len` for
+            # MTP K=N spec decode is `N + 1` (target + N drafted tokens).
+            _qlen_hip_on = (
+                _os.environ.get("VLLM_ROCM_QLEN_HIP", "0") == "1"
+            )
+            if (
+                _qlen_hip_on
+                and not _QLEN_HIP_PERCALL_ON
+                and not AiterFlashAttentionImpl._qlen_hip_workspace
+            ):
+                _spec = self.vllm_config.speculative_config
+                _spec_k = (
+                    int(_spec.num_speculative_tokens) if _spec is not None
+                    else 0
+                )
+                _decode_max_q = _spec_k + 1
+                # Cap `_max_T` at the largest captured cudagraph batch
+                # rather than `scheduler_config.max_num_seqs`. The runtime
+                # gate slices `tmp_out[:T]` so over-provisioning past the
+                # captured max is wasted (any larger batch falls back to
+                # the runtime grow path, which is rare). vLLM may set
+                # `max_num_seqs` larger than `max_cudagraph_capture_size`
+                # for batching headroom, but anything beyond captured
+                # sizes is eager-only and uncommon.
+                _max_num_seqs_sched = int(
+                    self.vllm_config.scheduler_config.max_num_seqs
+                )
+                _max_cg_size = int(
+                    getattr(
+                        self.vllm_config.compilation_config,
+                        "max_cudagraph_capture_size",
+                        _max_num_seqs_sched,
+                    )
+                    or _max_num_seqs_sched
+                )
+                _max_T = min(_max_num_seqs_sched, _max_cg_size) * _decode_max_q
+                _max_model_len = int(
+                    self.vllm_config.model_config.max_model_len
+                )
+                _P_max = (
+                    _max_model_len
+                    + _PARTITION_SIZE_ROCM
+                    - 1
+                ) // _PARTITION_SIZE_ROCM
+                _num_heads = int(self.num_heads_q)
+                _head_size = int(self.headdim)
+                _q_dtype = self.vllm_config.model_config.dtype
+                _q_elem_size = (
+                    torch.empty((), dtype=_q_dtype).element_size()
+                )
+                _packed = _QLEN_HIP_PACKED_ON
+                for _P in (1, _P_max):
+                    if _packed:
+                        # Single uint8 buffer holds all three slabs.
+                        # Layout: [tmp_out (T*H*P*D * sizeof(q_dtype))
+                        #          | exp_sums (T*H*P * 4)
+                        #          | max_logits (T*H*P * 4)]
+                        _bytes_tmp_out = (
+                            _max_T * _num_heads * _P * _head_size
+                            * _q_elem_size
+                        )
+                        _bytes_exp_sums = (
+                            _max_T * _num_heads * _P * 4
+                        )
+                        _bytes_max_logits = (
+                            _max_T * _num_heads * _P * 4
+                        )
+                        _bytes_total = (
+                            _bytes_tmp_out
+                            + _bytes_exp_sums
+                            + _bytes_max_logits
+                        )
+                        _packed_buf = torch.empty(
+                            _bytes_total,
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        _off_e = _bytes_tmp_out
+                        _off_m = _off_e + _bytes_exp_sums
+                        _tmp_out_buf = (
+                            _packed_buf[:_off_e]
+                            .view(_q_dtype)
+                            .view(
+                                _max_T, _num_heads, _P, _head_size
+                            )
+                        )
+                        _exp_sums_buf = (
+                            _packed_buf[_off_e:_off_m]
+                            .view(torch.float32)
+                            .view(_max_T, _num_heads, _P)
+                        )
+                        _max_logits_buf = (
+                            _packed_buf[_off_m:]
+                            .view(torch.float32)
+                            .view(_max_T, _num_heads, _P)
+                        )
+                        AiterFlashAttentionImpl._qlen_hip_workspace[_P] = {
+                            "tmp_out": _tmp_out_buf,
+                            "exp_sums": _exp_sums_buf,
+                            "max_logits": _max_logits_buf,
+                            "_packed_storage": _packed_buf,
+                        }
+                    else:
+                        _tmp_out_buf = torch.empty(
+                            (_max_T, _num_heads, _P, _head_size),
+                            dtype=_q_dtype,
+                            device=self.device,
+                        )
+                        _exp_sums_buf = torch.empty(
+                            (_max_T, _num_heads, _P),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        _max_logits_buf = torch.empty_like(_exp_sums_buf)
+                        AiterFlashAttentionImpl._qlen_hip_workspace[_P] = {
+                            "tmp_out": _tmp_out_buf,
+                            "exp_sums": _exp_sums_buf,
+                            "max_logits": _max_logits_buf,
+                        }
+                _bytes_total = sum(
+                    b["tmp_out"].numel() * b["tmp_out"].element_size()
+                    + b["exp_sums"].numel() * b["exp_sums"].element_size()
+                    + b["max_logits"].numel()
+                    * b["max_logits"].element_size()
+                    for b in AiterFlashAttentionImpl._qlen_hip_workspace.values()
+                )
+                # Print bucket pointer ranges so any captured-graph
+                # `Memory access fault` can be correlated against the
+                # workspace's actual address span. The fault's reported
+                # address (e.g. `0x7f2c06600000`) is one of:
+                #   * Inside a workspace bucket → kernel OOB write.
+                #   * Outside all buckets       → kernel reads from an
+                #     unrelated (kv cache / hidden state) buffer that
+                #     the captured graph aliased into a private pool.
+                # In packed mode, all three slabs share one storage so
+                # we report the storage range once per bucket, plus
+                # the (storage-relative) offsets of the three slabs.
+                _buf_ranges = []
+                for _P in sorted(
+                    AiterFlashAttentionImpl._qlen_hip_workspace.keys()
+                ):
+                    _b = AiterFlashAttentionImpl._qlen_hip_workspace[_P]
+                    if "_packed_storage" in _b:
+                        _s = _b["_packed_storage"]
+                        _s_start = _s.data_ptr()
+                        _s_end = _s_start + _s.numel()
+                        _buf_ranges.append(
+                            f"P={_P}.packed=[0x{_s_start:x},0x{_s_end:x})"
+                        )
+                        for _name in ("tmp_out", "exp_sums", "max_logits"):
+                            _t = _b[_name]
+                            _t_start = _t.data_ptr()
+                            _buf_ranges.append(
+                                f"P={_P}.{_name}@+{_t_start - _s_start}"
+                            )
+                    else:
+                        for _name in ("tmp_out", "exp_sums", "max_logits"):
+                            _t = _b[_name]
+                            _start = _t.data_ptr()
+                            _end = (
+                                _start + _t.numel() * _t.element_size()
+                            )
+                            _buf_ranges.append(
+                                f"P={_P}.{_name}=[0x{_start:x},0x{_end:x})"
+                            )
+                print(
+                    f"[qlen_hip_prealloc] "
+                    f"mode={'packed' if _QLEN_HIP_PACKED_ON else 'split'} "
+                    f"buckets={sorted(AiterFlashAttentionImpl._qlen_hip_workspace.keys())} "
+                    f"max_T={_max_T} P_max={_P_max} "
+                    f"num_heads={_num_heads} head_size={_head_size} "
+                    f"q_dtype={_q_dtype} "
+                    f"total_bytes={_bytes_total:,} "
+                    f"ranges=[{' | '.join(_buf_ranges)}]",
+                    flush=True,
+                )
+            if (
+                _qlen_hip_on
+                and _QLEN_HIP_PERCALL_ON
+                and not AiterFlashAttentionImpl._qlen_hip_percall_announced
+            ):
+                AiterFlashAttentionImpl._qlen_hip_percall_announced = True
+                print(
+                    "[qlen_hip_prealloc] mode=percall buckets=[] "
+                    "(workspace allocated on every kernel call; "
+                    "mirrors q=1 SHUFFLE arm)",
+                    flush=True,
+                )
         (
             num_decodes,
             num_extends,
@@ -913,6 +1240,32 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
+    # Class-level shared workspace cache for the q>1 SHUFFLE HIP MTP fast
+    # path. There are 184 attention layers in GLM-4.7-FP8/TP=4, so a
+    # per-instance dict would blow up memory by 184x. Only one layer's
+    # attention runs at a time, so a single shared workspace is enough.
+    #
+    # Layout per bucket (keyed by `max_num_partitions` P):
+    #   tmp_out:    [cap_T, num_heads, P, head_size]   (query.dtype)
+    #   exp_sums:   [cap_T, num_heads, P]              (fp32)
+    #   max_logits: [cap_T, num_heads, P]              (fp32)
+    #
+    # We slice `[:need_T]` per call (only first dim → stays contiguous).
+    # `_qlen_hip_oom_buckets` tracks (P, num_heads, head_size, dtype) tuples
+    # that have already failed to allocate so we don't retry every layer.
+    _qlen_hip_workspace: dict[int, dict[str, torch.Tensor]] = {}
+    _qlen_hip_oom_buckets: set[tuple] = set()
+    _qlen_hip_runtime_alloc_warned: set[tuple] = set()
+    # One-shot guard for the `mode=percall` startup print. PERCALL bypasses
+    # `_qlen_hip_workspace` entirely (every call allocates its own three
+    # buffers), so this banner is the only signal that PERCALL is active.
+    _qlen_hip_percall_announced: bool = False
+    # Monotonic per-process counter for the `[qlen_hip_diag]` per-call
+    # print (gated by `VLLM_ROCM_QLEN_HIP_DIAG=1`). Lets us cross-reference
+    # which captured step / which forward / which layer issued the
+    # offending kernel by counting backward from the last printed call#.
+    _qlen_hip_call_seq: int = 0
+
     def __init__(
         self,
         num_heads: int,
@@ -943,6 +1296,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
             logits_soft_cap = 0.0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+
+        # `_qlen_hip_workspace` lives on the class (see top of class), shared
+        # across all attention layers. Nothing per-instance is needed.
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -1557,6 +1913,558 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             )
                             return
                         # --- end qlen=2 SHUFFLE asm fast path ------------------------
+
+                        # --- begin q>1 SHUFFLE HIP MTP fast path (Option 2) -------------
+                        # Routes any qlen>1 SHUFFLE multi-token decode to
+                        # the MTP-templated HIP kernel
+                        # `paged_attention_ll4mi_QKV_mfma16_kernel` via
+                        # `paged_attention_common(force_hip=True,
+                        # mtp=decode_max_query_len)`.
+                        #
+                        # Why this exists:
+                        #   * Microbench (mtp_shuffle_kv_cache/
+                        #     bench_pa_hip_qlen2.py) shows HIP MTP is
+                        #     2.0x-3.1x faster than unified_attention
+                        #     across all measured (mc, ctx, qlen) cells
+                        #     at GLM-4.7-FP8 / TP=4 / MI355X.
+                        #   * The asm catalog has no Mtp>=2 binary, so
+                        #     K=2+ deployments (qlen>=3) cannot use the
+                        #     qlen2_asm arm above and would otherwise
+                        #     fall through to unified_attention. HIP MTP
+                        #     covers them.
+                        #   * `force_hip=True` skips
+                        #     `_should_use_asm_kernel`'s heuristic in
+                        #     `paged_attention_common`, so HIP fires
+                        #     even when total_heads > 2*cu_num — needed
+                        #     because the HIP MTP kernel beats asm at
+                        #     long ctx and is the only option at qlen>=3.
+                        #
+                        # Priority vs. the qlen=2 asm arm above: that
+                        # arm runs first and `return`s, so when both
+                        # `VLLM_ROCM_QLEN2_ASM=1` and
+                        # `VLLM_ROCM_QLEN_HIP=1`, asm captures
+                        # high-mc qlen=2 and HIP fills the rest
+                        # (low-mc qlen=2 and any qlen>=3). When
+                        # `VLLM_ROCM_QLEN2_ASM=0` and
+                        # `VLLM_ROCM_QLEN_HIP=1`, HIP captures every
+                        # q>1 SHUFFLE call.
+                        # Cap `decode_max_query_len` to reject calls that
+                        # vLLM lumped into the decode bucket but are
+                        # really chunked prefills / extends with long
+                        # query tokens (e.g. max_q=1000 for a 1000-token
+                        # extend chunk). The AITER PA kernel template
+                        # bakes `MTP` into per-thread shared memory and
+                        # register usage, so JIT-compiling for
+                        # `mtp=1000` fails (`make build -j1` returns
+                        # non-zero). Real MTP decode shapes are tiny
+                        # (qlen = num_speculative_tokens + 1, typically
+                        # 2-3); a cap of 8 is safe head-room and matches
+                        # what the asm catalog supports.
+                        _qlen_hip_gate = (
+                            _QLEN_HIP_ON
+                            and is_shuffle
+                            and decode_max_query_len > 1
+                            and decode_max_query_len <= 8
+                            and self.head_size == 128
+                            and num_decodes > 0
+                            # Skip the buggy `max_num_partitions=1`
+                            # launch shape (Run 5.H 2026-05-07). Real
+                            # workloads have per-seq KV ≫ 256; only
+                            # vLLM's capture-time dummy warmup data
+                            # ever hits this branch, where unified is
+                            # already fast enough.
+                            and int(attn_metadata.max_seq_len)
+                            >= _QLEN_HIP_MIN_K
+                        )
+
+                        # Probe-and-acquire the workspace BEFORE entering
+                        # the gate body. If the allocation OOMs (the P=512
+                        # bucket is ~1.5 GiB on GLM-4.7-FP8/TP=4/MI355X
+                        # and may not fit when KV cache is sized at default
+                        # `gpu_memory_utilization=0.9`), record the bucket
+                        # as unavailable and fall through to
+                        # `unified_attention` for that call. The gate keeps
+                        # firing for buckets that DID succeed, so we don't
+                        # lose the win for the small-P case (P=1, ~3 MiB).
+                        ws = None
+                        if _qlen_hip_gate:
+                            _ws_max_num_partitions = (
+                                attn_metadata.max_seq_len
+                                + _PARTITION_SIZE_ROCM
+                                - 1
+                            ) // _PARTITION_SIZE_ROCM
+                            _ws_need_T = int(num_decode_tokens)
+                            # CORRECTNESS-CRITICAL: must use the EXACT raw
+                            # P here. The kernel reads
+                            # `max_num_partitions = gridDim.y` (see
+                            # `pa.cuh:98`) and computes all tmp_out /
+                            # exp_sums / max_logits strides from it.
+                            # `gridDim.y` is set by the launcher from the
+                            # raw `ceil(max_context_len/256)`. If the
+                            # workspace buffer's P dimension differs from
+                            # gridDim.y, the kernel's writes land at wrong
+                            # offsets — output garbage propagates as a
+                            # silent correctness regression (acceptance
+                            # collapse to ~0). To bound memory growth use
+                            # LRU eviction below, NOT P rounding.
+                            _ws_need_P = int(_ws_max_num_partitions)
+                            _ws_bucket_id = (
+                                _ws_need_P,
+                                int(self.num_heads),
+                                int(self.head_size),
+                                str(query.dtype),
+                            )
+                            if _QLEN_HIP_PERCALL_ON:
+                                # Mirror the q=1 SHUFFLE arm: allocate fresh
+                                # workspace tensors on every call. During
+                                # CUDA graph capture this lands in the
+                                # current capture's private memory pool, so
+                                # every captured graph gets its own unique
+                                # workspace addresses baked in (instead of
+                                # all captures sharing one pre-allocated
+                                # tensor's address). This rules out the
+                                # "shared pre-alloc tensor aliased across
+                                # captured graphs" hypothesis. Cost: one
+                                # round of allocations per attn layer per
+                                # call (the q=1 SHUFFLE arm pays the same).
+                                ws = {
+                                    "tmp_out": torch.empty(
+                                        (
+                                            _ws_need_T,
+                                            int(self.num_heads),
+                                            _ws_need_P,
+                                            int(self.head_size),
+                                        ),
+                                        dtype=query.dtype,
+                                        device=query.device,
+                                    ),
+                                    "exp_sums": torch.empty(
+                                        (
+                                            _ws_need_T,
+                                            int(self.num_heads),
+                                            _ws_need_P,
+                                        ),
+                                        dtype=torch.float32,
+                                        device=query.device,
+                                    ),
+                                }
+                                ws["max_logits"] = torch.empty_like(
+                                    ws["exp_sums"]
+                                )
+                            elif (
+                                _ws_bucket_id
+                                in AiterFlashAttentionImpl._qlen_hip_oom_buckets
+                            ):
+                                _qlen_hip_gate = False
+                            else:
+                                ws = (
+                                    AiterFlashAttentionImpl._qlen_hip_workspace.get(
+                                        _ws_need_P
+                                    )
+                                )
+                                if (
+                                    ws is None
+                                    or ws["tmp_out"].size(0) < _ws_need_T
+                                    or ws["tmp_out"].dtype != query.dtype
+                                    or ws["tmp_out"].device != query.device
+                                ):
+                                    _grow_T = max(
+                                        _ws_need_T,
+                                        ws["tmp_out"].size(0)
+                                        if ws is not None
+                                        else 0,
+                                    )
+                                    # Should never trigger after build()
+                                    # pre-fill. Warn once per (P, dtype) so
+                                    # we know if the pre-alloc sizing missed
+                                    # something. Allocations during capture
+                                    # alias into private graph pools and may
+                                    # fault later.
+                                    _warn_key = (_ws_need_P, str(query.dtype))
+                                    if _QLEN_HIP_DIAG_ON and _warn_key not in (
+                                        AiterFlashAttentionImpl
+                                        ._qlen_hip_runtime_alloc_warned
+                                    ):
+                                        AiterFlashAttentionImpl._qlen_hip_runtime_alloc_warned.add(
+                                            _warn_key
+                                        )
+                                        _alloc_during_capture = bool(
+                                            torch.cuda.is_current_stream_capturing()
+                                        )
+                                        print(
+                                            f"[qlen_hip_alloc_runtime] "
+                                            f"need_T={_grow_T} need_P={_ws_need_P} "
+                                            f"during_capture={_alloc_during_capture} "
+                                            f"dtype={query.dtype} "
+                                            f"buckets_so_far="
+                                            f"{sorted(AiterFlashAttentionImpl._qlen_hip_workspace.keys())}"
+                                            f" — build() pre-alloc missed this bucket.",
+                                            flush=True,
+                                        )
+                                    try:
+                                        if _QLEN_HIP_PACKED_ON:
+                                            _q_elem_size = (
+                                                query.element_size()
+                                            )
+                                            _bytes_tmp_out = (
+                                                _grow_T
+                                                * int(self.num_heads)
+                                                * _ws_need_P
+                                                * int(self.head_size)
+                                                * _q_elem_size
+                                            )
+                                            _bytes_exp_sums = (
+                                                _grow_T
+                                                * int(self.num_heads)
+                                                * _ws_need_P
+                                                * 4
+                                            )
+                                            _bytes_max_logits = _bytes_exp_sums
+                                            _packed_buf = torch.empty(
+                                                _bytes_tmp_out
+                                                + _bytes_exp_sums
+                                                + _bytes_max_logits,
+                                                dtype=torch.uint8,
+                                                device=query.device,
+                                            )
+                                            _off_e = _bytes_tmp_out
+                                            _off_m = (
+                                                _off_e + _bytes_exp_sums
+                                            )
+                                            _tmp_out_buf = (
+                                                _packed_buf[:_off_e]
+                                                .view(query.dtype)
+                                                .view(
+                                                    _grow_T,
+                                                    int(self.num_heads),
+                                                    _ws_need_P,
+                                                    int(self.head_size),
+                                                )
+                                            )
+                                            _exp_sums_buf = (
+                                                _packed_buf[_off_e:_off_m]
+                                                .view(torch.float32)
+                                                .view(
+                                                    _grow_T,
+                                                    int(self.num_heads),
+                                                    _ws_need_P,
+                                                )
+                                            )
+                                            _max_logits_buf = (
+                                                _packed_buf[_off_m:]
+                                                .view(torch.float32)
+                                                .view(
+                                                    _grow_T,
+                                                    int(self.num_heads),
+                                                    _ws_need_P,
+                                                )
+                                            )
+                                        else:
+                                            _tmp_out_buf = torch.empty(
+                                                (
+                                                    _grow_T,
+                                                    int(self.num_heads),
+                                                    _ws_need_P,
+                                                    int(self.head_size),
+                                                ),
+                                                dtype=query.dtype,
+                                                device=query.device,
+                                            )
+                                            _exp_sums_buf = torch.empty(
+                                                (
+                                                    _grow_T,
+                                                    int(self.num_heads),
+                                                    _ws_need_P,
+                                                ),
+                                                dtype=torch.float32,
+                                                device=query.device,
+                                            )
+                                            _max_logits_buf = torch.empty_like(
+                                                _exp_sums_buf
+                                            )
+                                    except (
+                                        torch.cuda.OutOfMemoryError,
+                                        torch.OutOfMemoryError,
+                                        RuntimeError,
+                                    ) as _ws_oom_exc:
+                                        # Only swallow OOM-shaped errors; let
+                                        # other RuntimeErrors propagate.
+                                        if (
+                                            "out of memory"
+                                            not in str(_ws_oom_exc).lower()
+                                        ):
+                                            raise
+                                        AiterFlashAttentionImpl._qlen_hip_oom_buckets.add(
+                                            _ws_bucket_id
+                                        )
+                                        _bytes_needed = (
+                                            _grow_T
+                                            * int(self.num_heads)
+                                            * _ws_need_P
+                                            * (
+                                                int(self.head_size)
+                                                * query.element_size()
+                                                + 8  # exp_sums+max_logits fp32
+                                            )
+                                        )
+                                        print(
+                                            f"[qlen_hip_oom_fallback] "
+                                            f"bucket={_ws_bucket_id} "
+                                            f"need_T={_grow_T} "
+                                            f"need_P={_ws_need_P} "
+                                            f"~bytes={_bytes_needed:,} "
+                                            f"falling back to unified_attention "
+                                            f"for this bucket. Lower "
+                                            f"`--gpu-memory-utilization` to "
+                                            f"reclaim and re-enable HIP MTP "
+                                            f"for this P value.",
+                                            flush=True,
+                                        )
+                                        _qlen_hip_gate = False
+                                        ws = None
+                                    else:
+                                        _new_bucket = {
+                                            "tmp_out": _tmp_out_buf,
+                                            "exp_sums": _exp_sums_buf,
+                                            "max_logits": _max_logits_buf,
+                                        }
+                                        if _QLEN_HIP_PACKED_ON:
+                                            _new_bucket["_packed_storage"] = (
+                                                _packed_buf
+                                            )
+                                        # LRU eviction: bound the workspace
+                                        # dict to `_QLEN_HIP_WS_MAX_BUCKETS`
+                                        # entries. Without this the dict
+                                        # grows one entry per 256-token
+                                        # slice of `max_seq_len` (up to
+                                        # `max_model_len/256`), each
+                                        # holding a `T*H*P*D*2` byte
+                                        # tmp_out plus exp_sums/max_logits,
+                                        # eventually exhausting GPU memory
+                                        # (HSA queue creation fails with
+                                        # `Available Free mem : 0 MB`).
+                                        # We must NOT round P up to a
+                                        # coarser bucket here: the kernel
+                                        # reads `max_num_partitions =
+                                        # gridDim.y` (raw P) and writes
+                                        # tmp_out with raw-P stride; a
+                                        # mismatched buffer P silently
+                                        # corrupts the output.
+                                        _ws_dict = (
+                                            AiterFlashAttentionImpl._qlen_hip_workspace
+                                        )
+                                        # Drop oldest bucket(s) past the
+                                        # cap, but never evict the P=1
+                                        # bucket or the bucket we're
+                                        # about to install. Eviction
+                                        # follows insertion order via
+                                        # Python 3.7+ dict ordering, so
+                                        # the most-recently-touched bucket
+                                        # would be at the end — for true
+                                        # LRU we'd need to re-insert on
+                                        # access, but the workload
+                                        # locality means an FIFO drop is
+                                        # almost always equivalent.
+                                        while (
+                                            len(_ws_dict)
+                                            >= _QLEN_HIP_WS_MAX_BUCKETS
+                                        ):
+                                            _evict_key = None
+                                            for _k in _ws_dict:
+                                                if (
+                                                    _k != _ws_need_P
+                                                    and _k != 1
+                                                ):
+                                                    _evict_key = _k
+                                                    break
+                                            if _evict_key is None:
+                                                break
+                                            del _ws_dict[_evict_key]
+                                        _ws_dict[_ws_need_P] = _new_bucket
+                                        ws = _ws_dict[_ws_need_P]
+
+                        if _qlen_hip_gate:
+                            # Same SHUFFLE 5D view trick as the asm arm
+                            # above and the q=1 SHUFFLE arm at ~line 1737.
+                            num_blocks, block_size, num_kv_heads, _ = (
+                                key_cache.shape
+                            )
+                            x = 16 // key_cache.element_size()
+                            k_cache_template = torch.empty(
+                                [
+                                    num_blocks,
+                                    num_kv_heads,
+                                    self.head_size // x,
+                                    block_size,
+                                    x,
+                                ],
+                                dtype=key_cache.dtype,
+                                device="meta",
+                            )
+                            v_cache_template = torch.empty(
+                                [
+                                    num_blocks,
+                                    num_kv_heads,
+                                    block_size // x,
+                                    self.head_size,
+                                    x,
+                                ],
+                                dtype=value_cache.dtype,
+                                device="meta",
+                            )
+                            new_key_cache_hip = key_cache.view_as(
+                                k_cache_template
+                            )
+                            new_value_cache_hip = value_cache.view_as(
+                                v_cache_template
+                            )
+
+                            # Workspace was acquired (or grown) above
+                            # before entering this gate body — see the
+                            # probe-and-acquire block. `ws` is guaranteed
+                            # to be the bucket for `_ws_need_P` and to
+                            # have at least `_ws_need_T` rows.
+                            max_num_partitions = _ws_need_P
+                            need_T = _ws_need_T
+                            tmp_out_hip = ws["tmp_out"][:need_T]
+                            exp_sums_hip = ws["exp_sums"][:need_T]
+                            max_logits_hip = ws["max_logits"][:need_T]
+
+                            k_qscale_hip = (
+                                layer._k_scale
+                                if attn_metadata.k_scale is None
+                                else attn_metadata.k_scale
+                            )
+                            v_qscale_hip = (
+                                layer._v_scale
+                                if attn_metadata.v_scale is None
+                                else attn_metadata.v_scale
+                            )
+                            # Per-call diag, gated by VLLM_ROCM_QLEN_HIP_DIAG.
+                            # With HIP_LAUNCH_BLOCKING=1 the LAST line printed
+                            # before the `Memory access fault` is the call
+                            # that issued the bad memory op. We deliberately
+                            # do not GPU-sync here: that would be illegal
+                            # inside CUDA-graph capture (raises
+                            # `hipErrorStreamCaptureUnsupported`) and
+                            # `HIP_LAUNCH_BLOCKING=1` already serializes the
+                            # host-side launch sequence, which is enough to
+                            # attribute a fault.
+                            if _QLEN_HIP_DIAG_ON:
+                                AiterFlashAttentionImpl._qlen_hip_call_seq += 1
+                                _diag_seq = (
+                                    AiterFlashAttentionImpl._qlen_hip_call_seq
+                                )
+                                _diag_layer = (
+                                    getattr(layer, "layer_name", None)
+                                    or getattr(layer, "prefix", "?")
+                                )
+                                _diag_capturing = bool(
+                                    torch.cuda.is_current_stream_capturing()
+                                )
+                                _diag_ws_kind = (
+                                    "percall"
+                                    if _QLEN_HIP_PERCALL_ON
+                                    else (
+                                        "packed"
+                                        if _QLEN_HIP_PACKED_ON
+                                        else "split"
+                                    )
+                                )
+                                _diag_tmp_out_ptr = (
+                                    tmp_out_hip.data_ptr()
+                                )
+                                print(
+                                    f"[qlen_hip_diag] call#{_diag_seq} "
+                                    f"layer={_diag_layer} "
+                                    f"capturing={_diag_capturing} "
+                                    f"ws={_diag_ws_kind} "
+                                    f"qlen={int(decode_max_query_len)} "
+                                    f"num_decodes={int(num_decodes)} "
+                                    f"num_decode_tokens={int(num_decode_tokens)} "
+                                    f"max_seq_len={int(attn_metadata.max_seq_len)} "
+                                    f"P={int(_ws_need_P)} "
+                                    f"T={int(_ws_need_T)} "
+                                    f"tmp_out_ptr=0x{_diag_tmp_out_ptr:x}",
+                                    flush=True,
+                                )
+                            if (
+                                _QLEN_HIP_FENCE_ON
+                                and not torch.cuda.is_current_stream_capturing()
+                            ):
+                                if _QLEN_HIP_DIAG_ON:
+                                    print(
+                                        "[qlen_hip_fence] firing "
+                                        f"before call#{_diag_seq}",
+                                        flush=True,
+                                    )
+                                torch.cuda.synchronize()
+                            # CRITICAL: `paged_attention_rocm` (HIP MTP arm)
+                            # uses `query.size(0)` as `num_seqs` to size its
+                            # grid (`dim3 grid(num_seqs, max_num_partitions,
+                            # num_kv_heads)`) and the kernel internally
+                            # iterates `mtp` queries per seq via
+                            # `query_start_off = seq_idx * MTP + warp_mtp_idx`
+                            # (see `pa.cuh:187`, `pa_kernels.cuh:899`).
+                            #
+                            # The contract therefore is:
+                            #   - `Q.size(0) = num_decodes` (NOT
+                            #     `num_decode_tokens`),
+                            #   - `Q.stride(0) = num_heads * head_size` (one
+                            #     token's worth — same as
+                            #     `query[:num_decodes].stride(0)` because
+                            #     vLLM packs decode tokens contiguously),
+                            #   - underlying storage extends to
+                            #     `num_decode_tokens` rows so the kernel can
+                            #     walk past `size(0)` via per-token stride.
+                            #
+                            # `query[:num_decodes]` satisfies all three: it's
+                            # a contiguous view of the first `num_decodes`
+                            # rows, but the kernel's pointer arithmetic walks
+                            # the full `num_decode_tokens` rows because it's
+                            # raw-pointer access inside the kernel.
+                            #
+                            # If we instead pass `query[:num_decode_tokens]`,
+                            # the grid is sized `mtp×` too large; the kernel
+                            # then OOB-reads block_tables/seq_lens/Q and
+                            # OOB-writes output (`num_decodes * mtp²` rows
+                            # vs `num_decodes * mtp` allocated). At qlen=2
+                            # the OOB fits inside vLLM's per-layer padding
+                            # and corrupts silently; at qlen=3 it exceeds
+                            # padding and faults (Run 5.J root-cause).
+                            rocm_aiter_ops.paged_attention_common(
+                                Q=query[:num_decodes],
+                                K=new_key_cache_hip,
+                                V=new_value_cache_hip,
+                                tmp_out=tmp_out_hip,
+                                max_logits=max_logits_hip,
+                                exp_sums=exp_sums_hip,
+                                max_seq_len=attn_metadata.max_seq_len,
+                                block_tables=attn_metadata.block_table[
+                                    :num_decodes
+                                ],
+                                context_lens=attn_metadata.seq_lens[
+                                    :num_decodes
+                                ],
+                                block_tables_stride0=attn_metadata.block_table[
+                                    :num_decodes
+                                ].stride(0),
+                                scale=self.scale,
+                                K_QScale_hip=k_qscale_hip,
+                                V_QScale_hip=v_qscale_hip,
+                                K_QScale_asm=k_qscale_hip,
+                                V_QScale_asm=v_qscale_hip,
+                                out_=output[:num_decode_tokens],
+                                kv_cache_dtype=self.kv_cache_dtype,
+                                max_qlen=int(decode_max_query_len),
+                                qo_indptr=attn_metadata.query_start_loc[
+                                    : num_decodes + 1
+                                ],
+                                mtp=int(decode_max_query_len),
+                                force_hip=True,
+                            )
+                            return
+                        # --- end q>1 SHUFFLE HIP MTP fast path -------------------------
 
                         # Non-uniform query lengths can appear in real serving
                         # traffic (e.g. mixed datasets). Fall back to varlen

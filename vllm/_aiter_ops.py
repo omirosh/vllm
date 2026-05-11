@@ -2272,6 +2272,10 @@ class rocm_aiter_ops:
         V_QScale_asm: torch.Tensor,
         out_: torch.Tensor,
         kv_cache_dtype: str,
+        max_qlen: int = 1,
+        qo_indptr: "torch.Tensor | None" = None,
+        mtp: int = 1,
+        force_hip: bool = False,
     ):
         """
         Paged attention common function.
@@ -2279,6 +2283,28 @@ class rocm_aiter_ops:
         This function is NOT wrapped with @is_aiter_supported decorator
         to allow explicit backend selection via attention_config to work
         even when VLLM_ROCM_USE_AITER=0.
+
+        MTP extension (kept backward-compatible — `mtp=1, force_hip=False`
+        reproduces the q=1 single-token decode path used by the
+        SHUFFLE+high-mc arm in `AiterFlashAttentionImpl.forward`):
+            max_qlen:    when >1, the ASM arm dispatches to a multi-
+                         token-per-seq binary (e.g.
+                         `pa_bf16_pertokenFp8_gqa16_1tg_4w_mtp_msk1`
+                         for Mtp=1, qlen=2). Q must be `[num_seqs *
+                         max_qlen, num_heads, head_size]` with
+                         `qo_indptr` set.
+            qo_indptr:   `[num_seqs + 1]` int32 cumulative qlens for
+                         varlen Q. Required when `max_qlen > 1`.
+            mtp:         per-seq query length for the HIP arm. Routes
+                         to the MTP-templated
+                         `paged_attention_ll4mi_QKV_mfma16_kernel`
+                         which iterates over `MTP_PER_THREAD` queries
+                         per block (pa.cuh).
+            force_hip:   skip the ASM-eligibility heuristic and route
+                         to HIP regardless of mc. Used by vllm's
+                         `VLLM_ROCM_QLEN_HIP=1` arm for q>1 cases
+                         where the ASM catalog has no binary
+                         (e.g. Mtp>=2) — i.e. K=2/K=3 MTP.
 
         Note: This performs lazy import of aiter.paged_attention_common
         """
@@ -2302,6 +2328,10 @@ class rocm_aiter_ops:
             V_QScale_asm=V_QScale_asm,
             out_=out_,
             kv_cache_dtype=kv_cache_dtype,
+            max_qlen=max_qlen,
+            qo_indptr=qo_indptr,
+            mtp=mtp,
+            force_hip=force_hip,
         )
 
 
