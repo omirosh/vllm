@@ -2208,6 +2208,9 @@ class rocm_aiter_ops:
         K_QScale: torch.Tensor,
         V_QScale: torch.Tensor,
         out_: torch.Tensor,
+        max_qlen: int = 1,
+        qo_indptr: torch.Tensor = None,
+        high_precision: int = 1,
     ):
         """
         Paged attention forward pass using assembly kernel.
@@ -2215,6 +2218,21 @@ class rocm_aiter_ops:
         This function is NOT wrapped with @is_aiter_supported decorator
         to allow explicit backend selection via attention_config to work
         even when VLLM_ROCM_USE_AITER=0.
+
+        Args (kept backward-compatible — `max_qlen=1, qo_indptr=None`
+        reproduces the q=1 single-token decode path used by the
+        SHUFFLE+high-mc arm in `AiterFlashAttentionImpl.forward`):
+            max_qlen:    when >1, the asm dispatcher selects a multi-
+                         token-per-seq binary from the catalog (e.g.
+                         `pa_bf16_pertokenFp8_gqa16_1tg_4w_mtp_msk1`
+                         for Mtp=1, msk=1, qlen=max_qlen). Q must be
+                         laid out as `[num_seqs * max_qlen, num_heads,
+                         head_size]` with `qo_indptr` describing seq
+                         boundaries.
+            qo_indptr:   `[num_seqs + 1]` int32 cumulative qlens for
+                         varlen Q layout. Required when `max_qlen > 1`.
+            high_precision: forwarded to upstream pa_fwd_asm; controls
+                         the fp8 accumulation precision (0/1/2).
 
         Note: This performs lazy import of aiter.pa_fwd_asm
         """
@@ -2227,9 +2245,12 @@ class rocm_aiter_ops:
             block_tables=block_tables,
             context_lens=context_lens,
             block_tables_stride0=block_tables_stride0,
+            max_qlen=max_qlen,
             K_QScale=K_QScale,
             V_QScale=V_QScale,
             out_=out_,
+            qo_indptr=qo_indptr,
+            high_precision=high_precision,
         )
 
     @staticmethod

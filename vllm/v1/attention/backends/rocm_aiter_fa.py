@@ -46,6 +46,32 @@ import sys as _sys
 import threading as _threading
 
 _AITER_TRACE_ON: bool = _os.environ.get("VLLM_ROCM_AITER_TRACE_ATTN", "0") == "1"
+
+# Opt-out gate for the q=2 / SHUFFLE / causal MTP fast path that routes
+# to the `pa_bf16_pertokenFp8_gqa16_1tg_4w_mtp_msk1` aiter asm binary
+# (see the dispatcher arm in `AiterFlashAttentionImpl.forward` further
+# below). On by default; set `VLLM_ROCM_QLEN2_ASM=0` to fall back to
+# the Triton `unified_attention` path for A/B comparison.
+_QLEN2_ASM_ON: bool = _os.environ.get("VLLM_ROCM_QLEN2_ASM", "1") == "1"
+# Extends the qlen=2 ASM arm to fire at **all** mc, not just mc≥22 (the
+# default `_should_use_asm_kernel` threshold). Microbench
+# (`mtp_shuffle_kv_cache/bench_pa_fwd_asm_qlen2.py`, README Run 5.E)
+# shows ASM wins **1.7–2.1× at every mc** for ctx ≤ 4K — including the
+# mc=4–16 band the existing gate misses. Trade-off: at long ctx + low
+# mc (e.g. mc=4, ctx=16384) ASM is ~80 µs/call slower than
+# `unified_attention` (0.49× / +7 ms per outer step over 92 layers).
+# Typical MTP serving traffic stays in the short-ctx regime, so the
+# trade is heavily net-positive.
+#
+# This is also the simplest path to widen qlen=2 SHUFFLE coverage
+# without depending on the still-blocked HIP MTP captured-graph fault
+# (README Run 5.G/5.H): same kernel as Run 5.F's already-shipping
+# arm, captures cleanly, just one branch in the gate. Off by default
+# until production-validated.
+_QLEN2_ASM_ALL_ON: bool = (
+    _os.environ.get("VLLM_ROCM_QLEN2_ASM_ALL", "0") == "1"
+)
+
 _AITER_TRACE_LOCAL = _threading.local()
 
 
@@ -553,6 +579,7 @@ class AiterFlashAttentionMetadataBuilder(
                 dtype=torch.float32,
                 device=self.device,
             )
+
         (
             num_decodes,
             num_extends,
@@ -1342,6 +1369,195 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             )
                         )
                     else:
+                        # ---------------------------------------------------------------
+                        # Fast path: qlen=2 + causal + SHUFFLE MTP attention.
+                        #
+                        # The aiter asm catalog ships a binary specifically
+                        # for "K speculative tokens per seq sharing the
+                        # same context" causal attention:
+                        #   pa_bf16_pertokenFp8_gqa16_1tg_4w_mtp_msk1.co
+                        #     (catalog row Mtp=1 ⇒ qlen=2, Msk=1 = causal)
+                        # but the dispatcher historically routed every
+                        # q>1 decode through Triton `unified_attention`,
+                        # leaving the binary unreached. This arm carves
+                        # out exactly the case it was designed for.
+                        #
+                        # Applies to `num_speculative_tokens=1` MTP only.
+                        # At K=1 every q>1+causal decode call has
+                        # decode_max_query_len = K+1 = 2 (Forward 1 verify
+                        # and Forward 2 drafter step 1 both qualify).
+                        # The catalog has no Mtp=2 (qlen=3) row for this
+                        # quant config, so K≥2 deployments fall through
+                        # to unified_attention — no behaviour change.
+                        #
+                        # Gate predicates must be CPU-only: this arm
+                        # also runs inside CUDA-graph capture, where any
+                        # GPU→CPU sync (`tensor.item()`,
+                        # `tensor.all().item()`, etc.) raises
+                        # `hipErrorStreamCaptureUnsupported`.
+                        # `decode_max_query_len` is a python int from
+                        # `attn_metadata.decode_metadata.max_query_len`;
+                        # the multi-token decode arm processes the
+                        # entire decode batch at the same MTP step, so
+                        # `decode_max_query_len == 2` structurally
+                        # implies every seq's qlen is exactly 2 (mixed
+                        # prefill+decode shapes are split off into
+                        # `extend_metadata` before this branch). This
+                        # mirrors the q=1 SHUFFLE asm arm at ~line 1737,
+                        # which trusts `decode_max_query_len == 1`
+                        # without a runtime uniformity check.
+                        #
+                        # Behaviour-preserving opt-out: set
+                        # `VLLM_ROCM_QLEN2_ASM=0` to disable the arm and
+                        # fall back to `unified_attention` for A/B.
+                        try:
+                            from aiter.ops.attention import (
+                                _should_use_asm_kernel,
+                            )
+                            _have_asm_helper = True
+                        except Exception:
+                            _have_asm_helper = False
+
+                        # The default mc gate (`_should_use_asm_kernel`)
+                        # opens at `mc * num_q_heads > 2 * cu_num`, i.e.
+                        # mc≥22 on MI355X with GQA-16 / TP=4. Microbench
+                        # (Run 5.E) shows ASM also wins 1.7–2.1× at
+                        # ctx ≤ 4K for the full mc=4..16 band that the
+                        # default gate misses. `VLLM_ROCM_QLEN2_ASM_ALL=1`
+                        # bypasses the heuristic so we can pick up the
+                        # short-ctx low-mc rectangle, at the price of a
+                        # ~7 ms/step regression at the rare long-ctx +
+                        # low-mc cell. In CUDA-graph capture this gate
+                        # condition is constant per layer, so capture
+                        # records exactly the same kernel sequence as
+                        # mc≥22 captures do today (Run 5.F has been
+                        # production for two weeks → captures cleanly).
+                        if _QLEN2_ASM_ALL_ON:
+                            _qlen2_asm_mc_gate = (
+                                _have_asm_helper and num_decodes > 0
+                            )
+                        else:
+                            _qlen2_asm_mc_gate = (
+                                _have_asm_helper
+                                and _should_use_asm_kernel(
+                                    num_seqs=int(num_decodes),
+                                    num_heads=int(self.num_heads),
+                                    head_size=int(self.head_size),
+                                    kv_cache_tensor_dtype=key_cache.dtype,
+                                    high_precision=1,
+                                )
+                            )
+                        _qlen2_asm_gate = (
+                            _QLEN2_ASM_ON
+                            and is_shuffle
+                            and decode_max_query_len == 2
+                            and self.head_size == 128
+                            and num_decodes > 0
+                            and _qlen2_asm_mc_gate
+                        )
+
+                        if _qlen2_asm_gate:
+                            # Reinterpret KV cache in SHUFFLE-asm 5D
+                            # layouts (same memory; matches what the
+                            # q=1 SHUFFLE arm at ~line 1505 below does).
+                            num_blocks, block_size, num_kv_heads, _ = (
+                                key_cache.shape
+                            )
+                            x = 16 // key_cache.element_size()
+                            k_cache_template = torch.empty(
+                                [
+                                    num_blocks,
+                                    num_kv_heads,
+                                    self.head_size // x,
+                                    block_size,
+                                    x,
+                                ],
+                                dtype=key_cache.dtype,
+                                device="meta",
+                            )
+                            v_cache_template = torch.empty(
+                                [
+                                    num_blocks,
+                                    num_kv_heads,
+                                    block_size // x,
+                                    self.head_size,
+                                    x,
+                                ],
+                                dtype=value_cache.dtype,
+                                device="meta",
+                            )
+                            new_key_cache = key_cache.view_as(
+                                k_cache_template
+                            )
+                            new_value_cache = value_cache.view_as(
+                                v_cache_template
+                            )
+
+                            # Under SHUFFLE the cache values are at unit
+                            # scale, but `pa_fwd_asm` still dereferences
+                            # the descale-tensor pointers unconditionally
+                            # for fp8 KV — passing None here triggers a
+                            # GPU null-deref fault. Mirror the working
+                            # q=1 SHUFFLE asm arm at ~line 1737 below
+                            # (`paged_attention_common(..., K_QScale_asm=
+                            # attn_metadata.k_scale or layer._k_scale,
+                            # ...)`), which passes the per-block scale
+                            # tensors that SHUFFLE's
+                            # `reshape_and_cache_shuffle_kernel` writes
+                            # at value 1.0.
+                            k_qscale = (
+                                layer._k_scale
+                                if attn_metadata.k_scale is None
+                                else attn_metadata.k_scale
+                            )
+                            v_qscale = (
+                                layer._v_scale
+                                if attn_metadata.v_scale is None
+                                else attn_metadata.v_scale
+                            )
+                            _layer_tag = getattr(
+                                layer, "layer_name", None
+                            ) or getattr(layer, "prefix", "?")
+                            _aiter_trace_event(
+                                "mtp_qlen2_pa_fwd_asm",
+                                "before",
+                                layer=_layer_tag,
+                                q_shape=tuple(
+                                    query[:num_decode_tokens].shape
+                                ),
+                                num_decodes=int(num_decodes),
+                                max_k=int(attn_metadata.max_seq_len),
+                            )
+                            rocm_aiter_ops.pa_fwd_asm(
+                                Q=query[:num_decode_tokens],
+                                K=new_key_cache,
+                                V=new_value_cache,
+                                block_tables=attn_metadata.block_table[
+                                    :num_decodes
+                                ],
+                                context_lens=attn_metadata.seq_lens[
+                                    :num_decodes
+                                ],
+                                block_tables_stride0=attn_metadata.block_table[
+                                    :num_decodes
+                                ].stride(0),
+                                K_QScale=k_qscale,
+                                V_QScale=v_qscale,
+                                out_=output[:num_decode_tokens],
+                                max_qlen=2,
+                                qo_indptr=attn_metadata.query_start_loc[
+                                    : num_decodes + 1
+                                ],
+                                high_precision=1,
+                            )
+                            _aiter_trace_event(
+                                "mtp_qlen2_pa_fwd_asm",
+                                "after",
+                                layer=_layer_tag,
+                            )
+                            return
+                        # --- end qlen=2 SHUFFLE asm fast path ------------------------
+
                         # Non-uniform query lengths can appear in real serving
                         # traffic (e.g. mixed datasets). Fall back to varlen
                         # unified_attention instead of asserting.
